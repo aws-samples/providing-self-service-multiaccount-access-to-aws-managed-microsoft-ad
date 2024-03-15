@@ -1,0 +1,161 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Request for a Managed AD share
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID that will access the Managed AD instance
+
+Mappings:
+  Variables:
+    ManagedADHubAccountId:
+      Value: 012345678901
+    Route53Rule01:
+      Value: rslvr-rr-REPLACEME
+
+Resources:
+  Route53RuleAssociationManagedADVPC01:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      Name: Managed AD Route53 resolver rule
+      ResolverRuleId: !FindInMap [ Variables, Route53Rule01, Value ]
+      VPCId: !Ref VPC
+
+
+  RequestManageAD:
+    Type: Custom::RequestManageAD
+    Properties:
+      ServiceToken: !Sub
+        - arn:${AWS::Partition}:sns:${AWS::Region}:${HubAccountId}:Managed-AD-Sharing
+        - HubAccountId: !FindInMap [ Variables, ManagedADHubAccountId, Value ]
+
+
+  # Custom resource to accept the Directory share:
+  AcceptManagedADShare:
+    Type: Custom::AcceptShare
+    Properties:
+      ServiceToken: !GetAtt AcceptManagedADShareLambda.Arn
+      SharedDirectoryId: !Ref RequestManageAD
+
+
+  AcceptManagedADShareLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      ManagedPolicyArns: [ arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole ]
+      Policies:
+        - PolicyName: Lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowDescribeDirectories
+                Effect: Allow
+                Action:
+                  - ds:DescribeDirectories
+                Resource: '*'
+              - Sid: AcceptingSharedDirectory
+                Effect: Allow
+                Action:
+                  - ds:AcceptSharedDirectory
+                # Shared directory ARN changes to the current account ID, not the sharing account ID:
+                Resource: !Sub arn:${AWS::Partition}:ds:${AWS::Region}:${AWS::AccountId}:directory/*
+
+  AcceptManagedADShareLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt AcceptManagedADShareLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.config import Config
+          import cfnresponse
+          import traceback
+
+          boto3_config = Config(retries={'max_attempts': 10, 'mode': 'standard'})
+          ds = boto3.client('ds', config=boto3_config)
+
+
+          def handler(event, context):
+            print(f'event is {event}')
+            response_payload = {}
+            response_status = cfnresponse.FAILED
+            physical_resource_id = event.get('PhysicalResourceId', 'unset')
+            reason = None
+
+            try:
+              if event['RequestType'] == 'Delete':
+                # Directory will be unshared by another resource, so nothing to do:
+                response_status = cfnresponse.SUCCESS
+                
+              elif event['RequestType'] in ('Create','Update'):
+                shared_directory_id = event['ResourceProperties']['SharedDirectoryId']
+                physical_resource_id = f'{shared_directory_id}-share'
+                try:
+                  response = ds.accept_shared_directory(SharedDirectoryId=shared_directory_id)
+                  print(response)
+                  response_status = cfnresponse.SUCCESS
+                except ds.exceptions.DirectoryAlreadySharedException:
+                  reason = 'The directory share is already accepted.'
+                  # Comment this out if you want this to not be a failure:
+                  #response_status = cfnresponse.SUCCESS
+
+            except Exception as e:
+              print('ERROR: Caught exception:')
+              print(e)
+              reason = str(e)
+              traceback.print_exc()
+            finally:
+              print('Sending cfn response')
+              cfnresponse.send(event, context, response_status, response_payload, physical_resource_id, reason=reason)
+
+####################
+# Instance Profile #
+####################
+
+# The following instance profile can be used when launching EC2 instances
+# with the Seamless domain joins:
+
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref EC2SSMRole ]
+      InstanceProfileName: "SSMDirectoryServiceAccess"
+
+
+Outputs:
+  SharedDirectoryId:
+    Description: Shared Managed AD Directory ID
+    Value: !Ref RequestManageAD
+    Export:
+      Name: ManagedADDirectoryID
+

@@ -1,0 +1,260 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# This contains the SNS topic that is called by the requester account Service Catalog product when they
+# request for Managed AD. It calls a Lambda that shares the Managed AD with the calling account.
+# You need to run the following command in the Management account for sharing without handshakes to work: 
+#   aws organizations enable-aws-service-access --service-principal ds.amazonaws.com
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Managed AD Sharing hub
+
+Parameters:
+  ManagedADSharingSNSTopicName:
+    Type: String
+    Description: Name of SNS topic called by member account custom CFN resource
+    Default: Managed-AD-Sharing
+
+  OrgID:
+    Description: AWS Organizations ID
+    Type: String
+    AllowedPattern: ^o-[a-z0-9]{10,32}$
+
+  ManagedADDirectoryId:
+    Type: String
+    Description: (Leave blank to import value from blogs Managed AD template) Managed AD directory ID
+    Default: ""
+
+
+Conditions:
+  ManagedADDirectoryId: !Not [ !Equals [ !Ref ManagedADDirectoryId, '' ] ]
+
+Resources:
+
+  ADSharingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref ManagedADSharingSNSTopicName
+      DisplayName: AWS Managed AD status notifications 
+      Subscription:
+        - Endpoint: !GetAtt ADSharingLambda.Arn
+          Protocol: lambda
+      # Do not enable encryption (KmsMasterKeyId) with "alias/aws/sns"
+      # as the other accounts won't be able to use the default AWS key.
+      # If you need your SNS topics to be encrypted, create a customer
+      # KMS key that can be accessed by the AWS organization.
+
+
+  ADSharingTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F18
+            reason: Conditions restrict it to the Organization or Account
+    Properties:
+      Topics:
+        - !Ref ADSharingTopic
+      PolicyDocument:
+        Statement:
+          - Sid: AllowPublication
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - sns:Publish
+            Resource: !Ref ADSharingTopic
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrgID
+              ForAnyValue:StringEquals:
+                aws:CalledVia: [ "cloudformation.amazonaws.com" ]
+          - Sid: RequireSSL
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action:
+              - sns:Publish
+            Resource: !Ref ADSharingTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+            
+
+  ADSharingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowDirectoryAccess
+                Effect: Allow
+                Action:
+                  - ds:ShareDirectory
+                  - ds:AcceptSharedDirectory
+                  - ds:DescribeSharedDirectories
+                  - ds:UnshareDirectory 
+                Resource: !Sub 
+                  - arn:${AWS::Partition}:ds:${AWS::Region}:${AWS::AccountId}:directory/${ManagedAD}
+                  - ManagedAD: !If
+                    - ManagedADDirectoryId
+                    - !Ref ManagedADDirectoryId
+                    - !ImportValue ManagedADID
+
+
+  ADSharingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt ADSharingLambdaRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          DIRECTORY_ID: !If
+            - ManagedADDirectoryId
+            - !Ref ManagedADDirectoryId
+            - !ImportValue ManagedADID
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          from botocore.config import Config
+          import cfnresponse
+          import traceback
+          import os
+          import json
+          import time
+
+          boto3_config = Config(retries={'max_attempts': 10, 'mode': 'standard'})
+          ds = boto3.client('ds', config=boto3_config)
+
+
+          def wait_until_directory_shared(directory_id, shared_directory_id):
+            timeout = 60
+            timeout_start = time.time()
+            while time.time() < timeout_start + timeout:
+              current_status = ds.describe_shared_directories(
+                OwnerDirectoryId=directory_id,
+                SharedDirectoryIds=[shared_directory_id]
+              )['SharedDirectories'][0]['ShareStatus']
+
+              print(f'Current share status is {current_status}')
+              if current_status in ('Shared', 'PendingAcceptance'):
+                return True
+              if current_status in ('Rejected', 'ShareFailed', 'Deleted' ):
+                return False
+              time.sleep(2)
+
+            print('Timed out')
+            return False
+
+
+          def handler(event, context):
+            print(f'event is:')
+            print( json.dumps(event) )
+
+            msg = json.loads(event['Records'][0]['Sns']['Message'])
+            directory_id = os.environ['DIRECTORY_ID']
+
+            response_payload = {}
+            response_status = cfnresponse.FAILED
+            physical_resource_id = 'directory-not-yet-shared'
+            # Get account ID from StackId ARN:
+            stack_arn = msg['StackId']
+            account_id = stack_arn.split(':')[4]
+            print(f'Using account ID {account_id}')
+
+            print(f'Using directory id is {directory_id}')
+
+            try:
+              if msg['RequestType'] == 'Delete':
+                # Always return a success as otherwise it can cause the stack to get stuck:
+                response_status = cfnresponse.SUCCESS
+                ds.unshare_directory(
+                  DirectoryId = directory_id,
+                  UnshareTarget = {
+                    'Id': account_id,
+                    'Type': 'ACCOUNT',
+                  }
+                )
+                print(f'Successfully unshared directory from account {account_id}')
+                
+              elif msg['RequestType'] in ('Create','Update'):
+                try: 
+                  response = ds.share_directory(
+                    DirectoryId = directory_id,
+                    ShareNotes=f'Directory share from central Managed AD',
+                    ShareTarget = {
+                      'Id': account_id,
+                      'Type': 'ACCOUNT',
+                    },
+                    ShareMethod = 'HANDSHAKE'
+                  )
+                  shared_directory_id = response['SharedDirectoryId']
+                  # Return the shared directory ID as the physical resource:
+                  physical_resource_id = shared_directory_id
+
+                  print(f'reponse from share_directory() is {response}')
+
+                  if wait_until_directory_shared(directory_id, shared_directory_id):
+                    response_status = cfnresponse.SUCCESS
+                  
+                except ds.exceptions.DirectoryAlreadySharedException:
+                  print(f'Directory {directory_id} is already shared with account {account_id}')
+                  # Find the shared directory ID to set the physical ID:
+                  pages = ds.get_paginator('describe_shared_directories').paginate(OwnerDirectoryId=directory_id)
+                  for page in pages:
+                    found = False
+                    all_shared_directories = page['SharedDirectories']
+                    for a_shared_directory in all_shared_directories:
+                      if a_shared_directory['SharedAccountId'] == account_id:
+                        physical_resource_id = a_shared_directory['SharedDirectoryId']
+                        response_status = cfnresponse.SUCCESS
+                        found = True
+                        break
+                    if found:
+                      break
+
+            except Exception as e:
+              print('ERROR: Caught exception:')
+              print(e)
+              traceback.print_exc()
+
+            finally:
+              print('Sending cfn response')
+              cfnresponse.send(msg, context, response_status, response_payload, physical_resource_id)  
+            
+  ADSharingLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ADSharingLambda}"
+      RetentionInDays: 30
+
+
+  ADSharingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ADSharingLambda.Arn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref ADSharingTopic
+
+
+Outputs:
+  SNSTopicArn:
+    Description: SNS Topic Arn to use in spoke templates
+    Value: !Ref ADSharingTopic

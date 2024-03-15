@@ -1,0 +1,114 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Managed AD sharing Service Catalog portfolio and product
+
+Parameters:
+  ProviderName:
+    Type: String
+    Description: Organization name
+
+  ProductVersion:
+    Type: String
+    Description: Product version
+    Default: v1
+
+  PrincipalType:
+    Type: String
+    Description: Type of principal
+    AllowedValues:
+         - IAM_Identity_Center_Permission_Set
+         - IAM_role_name
+    Default: IAM_Identity_Center_Permission_Set
+ 
+  IAMIdentityCenterRegion:
+    Type: String
+    Description: (Only required if PrincipalType is IAM_Identity_Center_Permission_Set) IAM Identity Center home region
+    Default: "us-east-1"
+
+  PrincipalName01:
+    Type: String
+    Description: IAM role name or permission set that can access the Service Catalog product
+    Default: AWSAdministratorAccess
+
+  PrincipalName02:
+    Type: String
+    Description: (Optional) IAM role name or permission set that can access the Service Catalog product
+    Default: ""
+
+  TemplateURL:
+    Type: String
+    Description: HTTPS S3 URL to template
+
+Conditions:
+  PrincipleTypeIAMIdentityCenter: !Equals [ !Ref PrincipalType, "IAM_Identity_Center_Permission_Set" ]
+  PrincipalName01: !Not [ !Equals [ !Ref PrincipalName01, '' ] ]
+  PrincipalName02: !Not [ !Equals [ !Ref PrincipalName02, '' ] ]
+
+Resources:
+  Portfolio:
+    Type: AWS::ServiceCatalog::Portfolio
+    Properties:
+      AcceptLanguage: en
+      Description: "Request AWS Managed Microsoft AD share"
+      DisplayName: "Request AWS Managed Microsoft AD share"
+      ProviderName: !Ref ProviderName
+
+  Product:
+    Type: AWS::ServiceCatalog::CloudFormationProduct
+    Properties:
+      Description: "Request AWS Managed Microsoft AD share"
+      Name: "Request AWS Managed Microsoft AD share"
+      Owner: !Ref ProviderName
+      ProductType: CLOUD_FORMATION_TEMPLATE
+      ProvisioningArtifactParameters:
+        - Info:
+            LoadTemplateFromURL: !Ref TemplateURL
+          Name: !Ref ProductVersion 
+
+  PortfolioAssociation:
+    Type: AWS::ServiceCatalog::PortfolioProductAssociation
+    Properties:
+      PortfolioId: !Ref Portfolio
+      ProductId: !Ref Product
+
+  
+  PortfolioPrincipalAssociation01:
+    Condition: PrincipalName01
+    Type: AWS::ServiceCatalog::PortfolioPrincipalAssociation
+    Properties:
+      PortfolioId: !Ref Portfolio
+      PrincipalType: IAM_PATTERN
+      PrincipalARN: !If 
+        - PrincipleTypeIAMIdentityCenter
+        # then, https://docs.aws.amazon.com/singlesignon/latest/userguide/referencingpermissionsets.html
+        - !Sub arn:${AWS::Partition}:iam:::role/aws-reserved/sso.amazonaws.com/${IAMIdentityCenterRegion}/AWSReservedSSO_${PrincipalName01}_*
+        # else:
+        - !Sub arn:${AWS::Partition}:iam:::role/${PrincipalName01}
+
+  PortfolioPrincipalAssociation02:
+    Condition: PrincipalName02
+    Type: AWS::ServiceCatalog::PortfolioPrincipalAssociation
+    Properties:
+      PortfolioId: !Ref Portfolio
+      PrincipalType: IAM_PATTERN
+      PrincipalARN: !If 
+        - PrincipleTypeIAMIdentityCenter
+        # then, https://docs.aws.amazon.com/singlesignon/latest/userguide/referencingpermissionsets.html
+        - !Sub arn:${AWS::Partition}:iam:::role/aws-reserved/sso.amazonaws.com/${IAMIdentityCenterRegion}/AWSReservedSSO_${PrincipalName02}_*
+        # else:
+        - !Sub arn:${AWS::Partition}:iam:::role/${PrincipalName02}
+
+Outputs:
+  PortfolioID:
+    Description: Portfolio ID
+    Value: !Ref Portfolio
+    Export:
+      Name: ManagedADSharingPortfolioID
+
+  ProductID:
+    Description: Product ID
+    Value: !Ref Product
+    Export:
+      Name: ManagedADSharingProductID

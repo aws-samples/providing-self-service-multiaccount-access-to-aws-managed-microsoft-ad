@@ -1,0 +1,408 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Managed AD Route 53 DNS resolver rules and endpoints
+
+Parameters:
+  Route53RuleSharingPrincipalARN:
+    Type: String
+    Description: "ARN of the AWS Organization, OU, or account ID. For the Organization ARN, launch CloudShell and use output of the command: aws organizations describe-organization --query Organization.Arn --output text"
+    AllowedPattern: ^((\d{12})|(^arn:.*))$
+
+  CreateRAMServiceLinkedRole:
+    Type: String
+    Description: Select 'Yes', unless you get an erorr on creation saying the role already exists.
+    Default: "Yes"
+    AllowedValues:
+      - "Yes"
+      - "No"
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the Route53 resolver endpoints
+    Default: ""
+
+  OutboundResolverSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for the outbound resolver endpoint
+    Default: ""
+
+  OutboundResolverSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for the outbound resolver endpoint
+    Default: ""
+
+  OutboundResolverSubnet3:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for the outbound resolver endpoint
+    Default: ""
+
+  ManagedADDomain:
+    Type: String
+    Description: AWS Managed Microsoft AD domain name FQDN domain name (eg corp.example.com)
+    Default: ""
+
+  ManagedADDNSIPaddress1:
+    Type: String
+    Description: AWS Managed Microsoft AD domain name DNS IP address 1
+    Default: ""
+
+  ManagedADDNSIPaddress2:
+    Type: String
+    Description: AWS Managed Microsoft AD domain name DNS IP address 2
+    Default: ""
+
+  SelfManagedADDNSIPAddressPrimary:
+    Type: String
+    Description: (Optional) Self managed AD primary DNS server IP address.
+    Default: ""
+
+  SelfManagedADDNSIPAddressSecondary:
+    Type: String
+    Description: (Optional) Self managed AD secondary DNS server IP address
+    Default: ""
+
+  SelfManagedADDomain01:
+    Type: String
+    Description: (Optional) Self managed AD FQDN AD domain name (eg. test.example.com). Note that the trust needs to be manually set up.
+    Default: ""
+
+  SelfManagedADDomain02:
+    Type: String
+    Description: (Optional) Self managed AD secondary AD domain name. Note that the trust needs to be manually set up.
+    Default: ""
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Route53 rule sharing
+        Parameters:
+          - Route53RuleSharingPrincipalARN
+          - CreateRAMServiceLinkedRole
+
+      - Label:
+          default: Network configuration.
+        Parameters:
+          - VpcId
+          - OutboundResolverSubnet1
+          - OutboundResolverSubnet2
+          - OutboundResolverSubnet3
+
+      - Label:
+          default: (Optional) Self managed AD details if setting up trust
+        Parameters:
+          - SelfManagedADDomain01
+          - SelfManagedADDomain02
+          - SelfManagedADDNSIPAddressPrimary
+          - SelfManagedADDNSIPAddressSecondary
+
+      - Label:
+          default: Leave the following blank if using the blog AWS Managed Microsoft AD template
+        Parameters:
+          - ManagedADDomain
+          - ManagedADDNSIPaddress1
+          - ManagedADDNSIPaddress2
+     
+    ParameterLabels:
+      Route53RuleSharingPrincipalARN: 
+        default: Principal ARN to share rule with
+      CreateRAMServiceLinkedRole:
+        default: Create RAM Service Linked IAM Role?
+      SelfManagedADDomain01: 
+        default: (Optional) Self managed AD FQDN domain
+      SelfManagedADDomain02: 
+        default: (Optional) Self managed AD additional domain name
+      SelfManagedADDNSIPAddressPrimary:
+        default: (Optional) Self managed AD primary IP address
+      SelfManagedADDNSIPAddressSecondary:
+        default: (Optional) Self managed AD secondary IP address
+      VpcId:
+        default: VPC ID
+      OutboundResolverSubnet1:
+        default: Resolver subnet ID 1
+      OutboundResolverSubnet2:
+        default: Resolver subnet ID 2
+      OutboundResolverSubnet3:
+        default: Resolver subnet ID 3
+      ManagedADDomain:
+        default: AWS Managed Microsoft AD domain name
+      ManagedADDNSIPaddress1:
+        default: AWS Managed Microsoft AD IP address 1
+      ManagedADDNSIPaddress2:
+        default: AWS Managed Microsoft AD IP address 2
+
+Rules:
+  SubnetsInVPC:
+    Assertions:
+      - Assert:
+          'Fn::Equals':
+            - 'Fn::ValueOf':
+                - OutboundResolverSubnet1
+                - VpcId
+            - !Ref VpcId
+        AssertDescription: Subnet1 must be in given VPC
+      - Assert:
+          'Fn::Equals':
+            - 'Fn::ValueOf':
+                - OutboundResolverSubnet2
+                - VpcId
+            - !Ref VpcId
+        AssertDescription: Subnet2 must be in given VPC
+      - Assert:
+          'Fn::Equals':
+            - 'Fn::ValueOf':
+                - OutboundResolverSubnet3
+                - VpcId
+            - !Ref VpcId
+        AssertDescription: Subnet3 must be in given VPC
+
+
+
+Conditions:
+  CreateRAMServiceLinkedRole: !Equals [ !Ref CreateRAMServiceLinkedRole, 'Yes' ]
+
+  ManagedADDomain: !Not [ !Equals [ !Ref ManagedADDomain, '' ] ]
+  ManagedADDNSIPaddress1: !Not [ !Equals [ !Ref ManagedADDNSIPaddress1, '' ] ]
+  ManagedADDNSIPaddress2: !Not [ !Equals [ !Ref ManagedADDNSIPaddress2, '' ] ]
+
+  SelfManagedADDomain01: !Not [ !Equals [ !Ref SelfManagedADDomain01, '' ] ]
+  SelfManagedADDomain02: !Not [ !Equals [ !Ref SelfManagedADDomain02, '' ] ]
+
+
+Resources:
+
+#####################
+# Outbound endpoint #
+#####################
+
+  OutboundResolverEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Direction: OUTBOUND
+      Name: Outbound resolver endpoint
+      SecurityGroupIds:
+        - !Ref OutboundResolverSecurityGroup
+      IpAddresses:
+        - SubnetId: !Ref OutboundResolverSubnet1
+        - SubnetId: !Ref OutboundResolverSubnet2
+        - SubnetId: !Ref OutboundResolverSubnet3
+          
+
+  OutboundResolverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Route53 Outbound resolver security group
+      VpcId: !Ref VpcId 
+      SecurityGroupEgress:
+      # Allow egress to the AWS Managed AD IPs:
+      - !If
+        - ManagedADDNSIPaddress1
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${ManagedADDNSIPaddress1}/32"
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub
+            - "${ManagedADIPAddress1}/32"
+            - ManagedADIPAddress1: !ImportValue ManagedADIPAddress1
+
+      - !If
+        - ManagedADDNSIPaddress1
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${ManagedADDNSIPaddress1}/32"
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub
+            - "${ManagedADIPAddress1}/32"
+            - ManagedADIPAddress1: !ImportValue ManagedADIPAddress1
+
+      - !If
+        - ManagedADDNSIPaddress2
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${ManagedADDNSIPaddress2}/32"
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub
+            - "${ManagedADIPAddress2}/32"
+            - ManagedADIPAddress2: !ImportValue ManagedADIPAddress2
+
+      - !If
+        - ManagedADDNSIPaddress2
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${ManagedADDNSIPaddress2}/32"
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub
+            - "${ManagedADIPAddress2}/32"
+            - ManagedADIPAddress2: !ImportValue ManagedADIPAddress2
+
+      # Allow egress to the self managed AD IPs
+      - !If
+        - SelfManagedADDomain01
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${SelfManagedADDomain01}/32" 
+        - !Ref AWS::NoValue
+      - !If
+        - SelfManagedADDomain01
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${SelfManagedADDomain01}/32"
+        - !Ref AWS::NoValue
+      - !If
+        - SelfManagedADDomain02
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${SelfManagedADDomain02}/32" 
+        - !Ref AWS::NoValue
+      - !If
+        - SelfManagedADDomain02
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub "${SelfManagedADDomain02}/32" 
+        - !Ref AWS::NoValue
+
+
+
+###################
+# ManagedAD Rules #
+###################
+
+  # Lookup ${ManagedADDomain} using the ${ManagedADDNSIPaddress} servers
+  Route53RuleOutboundManagedAD:
+    Type: AWS::Route53Resolver::ResolverRule
+    Properties:
+      DomainName: !If
+        - ManagedADDomain
+        - !Ref ManagedADDomain 
+        - !ImportValue  ManagedADDomain
+      Name: AWS-Managed-Microsoft-AD-domain
+      ResolverEndpointId: !Ref OutboundResolverEndpoint
+      RuleType: FORWARD
+      TargetIps:
+        - Ip: !If
+          - ManagedADDNSIPaddress1
+          - !Ref ManagedADDNSIPaddress1 
+          - !ImportValue  ManagedADIPAddress1
+        - Ip: !If
+          - ManagedADDNSIPaddress2
+          - !Ref ManagedADDNSIPaddress2
+          - !ImportValue  ManagedADIPAddress2
+
+
+  Route53RuleOutboundManagedADAssociation:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      Name: Outbound-to-ManagedAD-association-01
+      ResolverRuleId: !Ref Route53RuleOutboundManagedAD
+      VPCId: !Ref VpcId 
+
+ 
+#########################
+# Self Managed AD Rules #
+#########################
+
+  # Lookup ${SelfManagedADDomain01} using the ${SelfManagedADDNSIPAddress} servers
+  Route53RuleOutboundSelfManagedAD01:
+    Condition: SelfManagedADDomain01
+    Type: AWS::Route53Resolver::ResolverRule
+    Properties:
+      DomainName: !Ref SelfManagedADDomain01
+      Name: Outbound-to-SelfManagedAD-01
+      ResolverEndpointId: !Ref OutboundResolverEndpoint
+      RuleType: FORWARD
+      TargetIps:
+        - Ip: !Ref SelfManagedADDNSIPAddressPrimary
+        - Ip: !Ref SelfManagedADDNSIPAddressSecondary
+        
+  Route53RuleOutbound01Association:
+    Condition: SelfManagedADDomain01
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      Name: Outbound-to-data-centre-association-01
+      ResolverRuleId: !Ref Route53RuleOutboundSelfManagedAD01
+      VPCId: !Ref VpcId 
+
+
+  # Lookup ${SelfManagedADDomain02} using the ${SelfManagedADDNSIPAddress} servers
+  Route53RuleOutboundSelfManagedAD02:
+    Condition: SelfManagedADDomain02
+    Type: AWS::Route53Resolver::ResolverRule
+    Properties:
+      DomainName: !Ref SelfManagedADDomain02
+      Name: Outbound-to-SelfManagedAD-02
+      ResolverEndpointId: !Ref OutboundResolverEndpoint
+      RuleType: FORWARD
+      TargetIps:
+        - Ip: !Ref SelfManagedADDNSIPAddressPrimary
+        - Ip: !Ref SelfManagedADDNSIPAddressSecondary
+
+  Route53RuleOutbound02Association:
+    Condition: SelfManagedADDomain02
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      Name: Outbound-to-data-centre-association-02
+      ResolverRuleId: !Ref Route53RuleOutboundSelfManagedAD02
+      VPCId: !Ref VpcId 
+
+
+# ###########
+# # Sharing #
+# ###########
+
+  # IAM service role for Resource Access Manager
+  RAMServiceLinkedRole:
+    Condition: CreateRAMServiceLinkedRole
+    Type: AWS::IAM::ServiceLinkedRole
+    Properties:
+      AWSServiceName: 'ram.amazonaws.com'
+      Description: Allows RAM to access Organizations on your behalf.
+
+  ShareRules:
+    Type: AWS::RAM::ResourceShare
+    Properties:
+      AllowExternalPrincipals: false
+      Name: Route53 Resolver Rules Resource Share
+      ResourceArns:
+        - !GetAtt Route53RuleOutboundManagedAD.Arn
+        - !If [ SelfManagedADDomain01, !GetAtt Route53RuleOutboundSelfManagedAD01.Arn, !Ref AWS::NoValue ]
+        - !If [ SelfManagedADDomain02, !GetAtt Route53RuleOutboundSelfManagedAD02.Arn, !Ref AWS::NoValue ]
+      Principals: 
+        - !Ref Route53RuleSharingPrincipalARN
+      Tags:
+        - Key: purpose
+          Value: Route53 shared resolver rules for AD
+
+
+Outputs:
+  Route53RuleManagedAD:
+    Description: Route53 Resolver rule ID for use with AWS Managed Microsoft AD
+    Value: !Ref Route53RuleOutboundManagedAD
+
+  Route53RuleSelfManagedAD01:
+    Condition: SelfManagedADDomain01
+    Description: Self managed AD Route53 Resolver Rule ID 1
+    Value: !Ref Route53RuleOutboundSelfManagedAD01
+
+  Route53RuleSelfManagedAD02:
+    Condition: SelfManagedADDomain02
+    Description: Self managed AD Route53 Resolver Rule ID 2
+    Value: !Ref Route53RuleOutboundSelfManagedAD02

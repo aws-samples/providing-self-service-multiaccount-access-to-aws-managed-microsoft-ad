@@ -1,0 +1,438 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Sample quick test VPC for AWS Managed Microsoft AD testing
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Test VPC to quickly test AWS Managed Microsoft AD sharing
+
+Parameters:
+    VPCNetwork:
+        Description: Network to assign to the created test VPC. Do not include the mask. Make sure peered VPC have unique network values.
+        Type: String
+        Default: 10.111.0.0
+        AllowedPattern: ^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$
+
+    CIDRPrefix:
+        Description: Network/CIDR to assign to the created VPC
+        Type: Number
+        Default: 24
+        AllowedValues:
+          - 24
+          - 22
+          - 19
+
+    VPCName:
+        Description: Text to append to Name tag. Do not include "VPC" in the name.
+        Type: String
+        Default: Test-AWS-Managed-Microsoft-AD
+
+    HaveMultiAZNAT:
+        Description: NAT gateway in each AZ?
+        Type: String
+        AllowedValues:
+            - "Yes"
+            - "No"
+        ConstraintDescription: Either yes or no
+        Default: "No"
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required values
+        Parameters:
+          - VPCName
+          - VPCNetwork
+          - CIDRPrefix
+      - Label:
+          default: Options
+        Parameters:
+          - HaveMultiAZNAT                 
+    ParameterLabels:
+      VPCName: 
+        default: VPC name (do not include "vpc")
+      VPCNetwork:
+        default: VPC network, without subnet mask or CIDR
+      CIDRPrefix:
+        default: CIDR prefix
+      HaveMultiAZNAT:
+        default: Create NAT GW in every AZ?
+
+
+Conditions:
+    MultiAZNAT: !Equals [ !Ref HaveMultiAZNAT, "Yes" ]
+
+Mappings:
+  Variables:
+    LogRetentionDays:
+      Value: 90
+  VpcPrefixToSubnet:
+    "24":
+      subnetMask: 27
+      subnetBits: 5 # 32-27
+    "22":
+      subnetMask: 25
+      subnetBits: 7 # 32-25  
+    "19":
+      subnetMask: 22
+      subnetBits: 10 # 32-22
+
+
+Resources:
+
+    VPC:
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: !Sub "${VPCNetwork}/${CIDRPrefix}"
+            EnableDnsSupport: true
+            EnableDnsHostnames: true
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} VPC 
+
+
+  ##################
+  # Public Subnets #
+  ##################
+
+    InternetGateway:
+        Type: AWS::EC2::InternetGateway
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Internet Gateway
+    InternetGatewayAttachment:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+            VpcId: !Ref VPC
+            InternetGatewayId: !Ref InternetGateway
+
+
+    PublicSubnetA:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 0
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 0, "Fn::GetAZs" : "" ]
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Subnet A
+    PublicSubnetB:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 1
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 1, "Fn::GetAZs" : "" ] 
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Subnet B 
+    PublicSubnetC:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 2
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 2, "Fn::GetAZs" : "" ] 
+            MapPublicIpOnLaunch: false
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Subnet C
+
+
+    PublicRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Public Route table 
+
+
+    PublicRouteDefault:
+        Type: AWS::EC2::Route
+        DependsOn: InternetGatewayAttachment
+        Properties:
+            GatewayId: !Ref InternetGateway
+            RouteTableId: !Ref PublicRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+
+ 
+    PublicRouteAssociationA:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetA
+    PublicRouteAssociationB:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetB
+    PublicRouteAssociationC:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnetC
+
+
+    NATElasticIPA:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+    NATElasticIPB:
+        Condition: MultiAZNAT
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+    NATElasticIPC:
+        Condition: MultiAZNAT
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+
+    NATGatewayA:
+        Type: AWS::EC2::NatGateway
+        DependsOn: PublicRouteAssociationA
+        Properties:
+            AllocationId: !GetAtt NATElasticIPA.AllocationId
+            SubnetId: !Ref PublicSubnetA
+    NATGatewayB:
+        Type: AWS::EC2::NatGateway
+        Condition: MultiAZNAT
+        DependsOn: PublicRouteAssociationB
+        Properties:
+            AllocationId: !GetAtt NATElasticIPB.AllocationId
+            SubnetId: !Ref PublicSubnetB
+    NATGatewayC:
+        Type: AWS::EC2::NatGateway
+        Condition: MultiAZNAT
+        DependsOn: PublicRouteAssociationC
+        Properties:
+            AllocationId: !GetAtt NATElasticIPC.AllocationId
+            SubnetId: !Ref PublicSubnetC
+
+
+  ###################
+  # Private Subnets #
+  ###################
+
+    PrivateSubnetA:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 3
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 0, "Fn::GetAZs" : "" ] 
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Subnet A 
+    PrivateSubnetB:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 4
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 1, "Fn::GetAZs" : "" ] 
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Subnet B 
+    PrivateSubnetC:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            CidrBlock: !Select
+              - 5
+              - !Cidr
+                - !GetAtt VPC.CidrBlock
+                - 6
+                - !FindInMap [ VpcPrefixToSubnet, !Ref "CIDRPrefix", subnetBits ] 
+            AvailabilityZone: !Select [ 2, "Fn::GetAZs" : "" ] 
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Subnet C 
+
+
+    PrivateRouteTableA:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !If
+                    - MultiAZNAT
+                    - !Sub ${VPCName} Private Route table A 
+                    - !Sub ${VPCName} Private Route table
+    PrivateRouteTableB:
+        Condition: MultiAZNAT
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Route table B 
+    PrivateRouteTableC:
+        Condition: MultiAZNAT
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref VPC
+            Tags:
+                - Key: Name
+                  Value: !Sub ${VPCName} Private Route table C 
+
+    PrivateRouteA:
+        Type: AWS::EC2::Route
+        Properties:
+            NatGatewayId: !Ref NATGatewayA
+            RouteTableId: !Ref PrivateRouteTableA
+            DestinationCidrBlock: 0.0.0.0/0
+    # Rest only create if the NAT is multi-AZ
+    PrivateRouteB:
+        Type: AWS::EC2::Route
+        Condition: MultiAZNAT        
+        Properties:
+            NatGatewayId: !Ref NATGatewayB
+            RouteTableId: !Ref PrivateRouteTableB
+            DestinationCidrBlock: 0.0.0.0/0
+    PrivateRouteC:
+        Type: AWS::EC2::Route
+        Condition: MultiAZNAT        
+        Properties:
+            NatGatewayId: !Ref NATGatewayC
+            RouteTableId: !Ref PrivateRouteTableC
+            DestinationCidrBlock: 0.0.0.0/0
+
+
+    PrivateRouteAssociationA:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PrivateRouteTableA
+            SubnetId: !Ref PrivateSubnetA
+    # If it's not MultiAZ, use Route table A for everything :
+    PrivateRouteAssociationB:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !If [ MultiAZNAT, !Ref PrivateRouteTableB, !Ref PrivateRouteTableA ]
+            SubnetId: !Ref PrivateSubnetB
+    PrivateRouteAssociationC:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !If [ MultiAZNAT, !Ref PrivateRouteTableC, !Ref PrivateRouteTableA ]
+            SubnetId: !Ref PrivateSubnetC
+
+
+#############
+# Flow logs #
+#############
+
+    VPCFlowLogGroup:
+        Type: AWS::Logs::LogGroup
+        Properties:
+            RetentionInDays: !FindInMap [ Variables, LogRetentionDays, Value ]
+
+    VPCFlowLogRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service: [ vpc-flow-logs.amazonaws.com ]
+                      Action: sts:AssumeRole
+            Policies:
+                - PolicyName: flowlogs-policy
+                  PolicyDocument:
+                    Version: '2012-10-17'
+                    Statement:
+                        - Effect: Allow
+                          Action:
+                              - 'logs:CreateLogStream'
+                              - 'logs:PutLogEvents'
+                              - 'logs:DescribeLogGroups'
+                              - 'logs:DescribeLogStreams'
+                          Resource: !GetAtt 'VPCFlowLogGroup.Arn'
+
+    VPCFlowLogs:
+        Type: AWS::EC2::FlowLog
+        Properties:
+            DeliverLogsPermissionArn: !GetAtt 'VPCFlowLogRole.Arn'
+            LogDestinationType: cloud-watch-logs
+            LogGroupName: !Ref VPCFlowLogGroup
+            ResourceType: 'VPC'
+            ResourceId: !Ref VPC
+            TrafficType: ALL
+
+
+       
+###########
+# Outputs #
+###########
+
+Outputs:
+    VpcId:
+        Description: VPC ID
+        Value: !Ref VPC
+        Export:
+            Name: !Sub ${AWS::StackName}-VpcId
+
+    PublicSubnetA:
+        Description: Public Subnet A ID
+        Value: !Ref PublicSubnetA
+        Export:
+            Name: !Sub ${AWS::StackName}-PublicSubnetA
+
+    PublicSubnetB:
+        Description: Public Subnet B ID
+        Value: !Ref PublicSubnetB
+        Export:
+            Name: !Sub ${AWS::StackName}-PublicSubnetB
+
+    PublicSubnetC:
+        Description: Public Subnet C ID
+        Value: !Ref PublicSubnetC
+        Export:
+            Name: !Sub ${AWS::StackName}-PublicSubnetC
+
+    PrivateSubnetA:
+        Description: Private Subnet A ID
+        Value: !Ref PrivateSubnetA
+        Export:
+            Name: !Sub ${AWS::StackName}-PrivateSubnetA
+
+    PrivateSubnetB:
+        Description: Private Subnet B ID
+        Value: !Ref PrivateSubnetB
+        Export:
+            Name: !Sub ${AWS::StackName}-PrivateSubnetB
+
+    PrivateSubnetC:
+        Description: Private Subnet C ID
+        Value: !Ref PrivateSubnetC
+        Export:
+            Name: !Sub ${AWS::StackName}-PrivateSubnetC
+
